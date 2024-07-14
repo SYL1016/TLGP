@@ -1,0 +1,105 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+
+# Generate synthetic wind power data
+np.random.seed(42)
+time_steps = 1000  # Reduced dataset size for quicker computation
+data = np.sin(np.linspace(0, 20, time_steps)) + np.random.normal(scale=0.5, size=time_steps)
+data = data.reshape(-1, 1)
+data = np.hstack((np.arange(time_steps).reshape(-1, 1), data))  # Add time feature
+
+# Convert to DataFrame
+df = pd.DataFrame(data, columns=['time', 'wind_power'])
+
+# Data normalization
+scaler = StandardScaler()
+normalized_data = scaler.fit_transform(df)
+
+# Define useful variables
+N = len(normalized_data)
+M = 10  # Window size
+L = 3  # Time lag order, as an example
+
+# Prepare training and testing data
+train_data = normalized_data[:int(0.8 * N)]
+test_data = normalized_data[int(0.8 * N):]
+
+# Kernel function
+def kernel(x1, x2, length_scale, sigma_f):
+    """ Radial Basis Function (RBF) Kernel """
+    sqdist = np.sum(x1**2, 1).reshape(-1, 1) + np.sum(x2**2, 1) - 2 * np.dot(x1, x2.T)
+    return sigma_f**2 * np.exp(-0.5 / length_scale**2 * sqdist)
+
+# Prediction function
+def predict(X_train, Y_train, X_test, length_scale, sigma_f, sigma_y):
+    K = kernel(X_train, X_train, length_scale, sigma_f) + sigma_y**2 * np.eye(len(X_train))
+    K_s = kernel(X_train, X_test, length_scale, sigma_f)
+    K_ss = kernel(X_test, X_test, length_scale, sigma_f) + 1e-8 * np.eye(len(X_test))
+    
+    K_inv = np.linalg.inv(K)
+    
+    mu_s = K_s.T.dot(K_inv).dot(Y_train)
+    cov_s = K_ss - K_s.T.dot(K_inv).dot(K_s)
+    
+    return mu_s, cov_s
+
+# Moving window predictions
+def moving_window_predictions(data, window_size, length_scale, sigma_f, sigma_y):
+    predictions = []
+    for i in range(window_size, len(data)):
+        X_train = data[i-window_size:i, :-1]
+        Y_train = data[i-window_size:i, -1]
+        X_test = data[i, :-1].reshape(1, -1)
+        
+        mu, _ = predict(X_train, Y_train, X_test, length_scale, sigma_f, sigma_y)
+        predictions.append(mu[0])
+    
+    return np.array(predictions)
+
+# Sum of squared errors
+def sse(params, data, window_size):
+    length_scale, sigma_f, sigma_y = params
+    predictions = moving_window_predictions(data, window_size, length_scale, sigma_f, sigma_y)
+    actual = data[window_size:, -1]
+    return np.sum((predictions - actual)**2)
+
+# Initial hyperparameters guess
+initial_params = [1.0, 1.0, 0.1]
+
+# Optimize hyperparameters using L-BFGS-B method
+res = minimize(sse, initial_params, args=(train_data, M), method='L-BFGS-B', bounds=((1e-5, None), (1e-5, None), (1e-5, None)))
+
+optimal_params = res.x
+print(f'Optimal Parameters: length_scale={optimal_params[0]}, sigma_f={optimal_params[1]}, sigma_y={optimal_params[2]}')
+
+# Train the model
+length_scale, sigma_f, sigma_y = optimal_params
+train_predictions = moving_window_predictions(train_data, M, length_scale, sigma_f, sigma_y)
+test_predictions = moving_window_predictions(test_data, M, length_scale, sigma_f, sigma_y)
+
+# Denormalize predictions
+train_predictions_denorm = scaler.inverse_transform(np.hstack((train_data[M:, :-1], train_predictions.reshape(-1, 1))))[:, -1]
+test_predictions_denorm = scaler.inverse_transform(np.hstack((test_data[M:, :-1], test_predictions.reshape(-1, 1))))[:, -1]
+
+# Plot results
+plt.figure(figsize=(14, 7))
+
+# Plot training data predictions
+plt.subplot(2, 1, 1)
+plt.plot(range(M, len(train_data)), scaler.inverse_transform(train_data[M:, :])[:, -1], label='Actual')
+plt.plot(range(M, len(train_data)), train_predictions_denorm, label='Predicted')
+plt.title('Training Data Predictions')
+plt.legend()
+
+# Plot testing data predictions
+plt.subplot(2, 1, 2)
+plt.plot(range(M, len(test_data)), scaler.inverse_transform(test_data[M:, :])[:, -1], label='Actual')
+plt.plot(range(M, len(test_data)), test_predictions_denorm, label='Predicted')
+plt.title('Testing Data Predictions')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
