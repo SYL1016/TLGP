@@ -1,0 +1,187 @@
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import joblib
+from scipy.optimize import minimize
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, DotProduct, WhiteKernel
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+class GPRKF:
+    def __init__(self, kernel=None, window_size=100, alpha=3.0364181905772343e-06):
+        if kernel is None:
+            # Define kernels for SOC, Tavg, and Current (I)
+            kernel_SOC = C(1.0, (1e-20, 1e7)) * RBF(length_scale=1.0, length_scale_bounds=(1e-10, 1e5)) \
+                         + C(1.0, (1e-20, 1e7)) * DotProduct()
+            kernel_Tavg = C(1.0, (1e-20, 1e7)) * RBF(length_scale=1.0, length_scale_bounds=(1e-10, 1e5)) \
+                          + C(1.0, (1e-20, 1e7)) * DotProduct()
+            kernel_I = C(1.0, (1e-20, 1e7)) * RBF(length_scale=1.0, length_scale_bounds=(1e-10, 1e5)) \
+                       + C(1.0, (1e-20, 1e7)) * DotProduct()
+            self.kernel = (kernel_SOC * kernel_Tavg * kernel_I) + WhiteKernel(noise_level=1e-5,
+                                                                              noise_level_bounds=(1e-50, 1e10))
+        else:
+            self.kernel = kernel
+
+        self.alpha = alpha
+        self.window_size = window_size
+
+    def kernel_func(self, x1, x2, length_scale, sigma_f):
+        """ Combined kernel function """
+        sqdist = np.sum(x1**2, 1).reshape(-1, 1) + np.sum(x2**2, 1) - 2 * np.dot(x1, x2.T)
+        rbf_component = sigma_f**2 * np.exp(-0.5 / length_scale**2 * sqdist)
+        dot_product_component = np.dot(x1, x2.T)
+        return rbf_component + dot_product_component
+
+    def predict(self, X_train, Y_train, X_test, length_scale, sigma_f, sigma_y):
+        K = self.kernel_func(X_train, X_train, length_scale, sigma_f) + sigma_y**2 * np.eye(len(X_train))
+        K_s = self.kernel_func(X_train, X_test, length_scale, sigma_f)
+        K_ss = self.kernel_func(X_test, X_test, length_scale, sigma_f) + 1e-8 * np.eye(len(X_test))
+
+        K_inv = np.linalg.inv(K)
+
+        mu_s = K_s.T.dot(K_inv).dot(Y_train)
+        cov_s = K_ss - K_s.T.dot(K_inv).dot(K_s)
+
+        return mu_s, cov_s
+
+    def moving_window_predictions(self, data, window_size, length_scale, sigma_f, sigma_y):
+        predictions = []
+        std_devs = []
+        for i in range(window_size, len(data)):
+            X_train = data[i-window_size:i, :-2]
+            Y_train = data[i-window_size:i, -2:]
+            X_test = data[i, :-2].reshape(1, -1)
+
+            if X_train.shape[0] == 0 or Y_train.shape[0] == 0 or X_test.shape[0] == 0:
+                print(f"Skipping window starting at index {i-window_size} due to empty data.")
+                continue
+
+            mu, cov = self.predict(X_train, Y_train, X_test, length_scale, sigma_f, sigma_y)
+            # std_dev = np.sqrt(np.diag(cov))  # Calculate standard deviation
+            std_dev = np.sqrt(np.clip(np.diag(cov), 0, None))  
+
+            predictions.append(mu)
+            std_devs.append(std_dev)
+
+        if not predictions:
+            raise ValueError("No predictions were made; check the data and window size.")
+
+        return np.vstack(predictions), np.vstack(std_devs)
+
+    def sse(self, params, data, window_size):
+        length_scale, sigma_f, sigma_y = params
+        predictions, _ = self.moving_window_predictions(data, window_size, length_scale, sigma_f, sigma_y)
+        actual = data[window_size:, -2:]
+        return np.sum((predictions - actual)**2)
+
+    def optimize_hyperparameters(self, train_data, window_size):
+        initial_params = [1.0, 1.0, 0.1]
+        res = minimize(self.sse, initial_params, args=(train_data, window_size), method='L-BFGS-B', bounds=((1e-5, None), (1e-5, None), (1e-5, None)))
+        return res.x
+
+# Load training and testing data
+train_data_path = 'C:\\Users\\ml202sl\\OneDrive - University of Leeds\\01.Research\\01.Data\\02. Second year experiments\\NCR 18650\\Series pack\\GPRUKF code and results\\GPR_SOC\\Pack-GPR-UKF-Codes\\Pack_15_3_Discharging_process_training.xlsx'
+test_data_path = 'C:\\Users\\ml202sl\\OneDrive - University of Leeds\\01.Research\\01.Data\\02. Second year experiments\\NCR 18650\\Series pack\\GPRUKF code and results\\GPR_SOC\\Pack-GPR-UKF-Codes\\Dischargingtestdataset.xlsx'
+
+df_train = pd.read_excel(train_data_path)
+df_test = pd.read_excel(test_data_path)
+
+# Ensure columns are correctly identified for input and output
+df_train = df_train[['Voltage', 'Strain', 'Current', 'SOC', 'Average Temp']]
+df_test = df_test[['Voltage', 'Strain', 'Current', 'SOC', 'Average Temp']]
+
+# Separate inputs and outputs
+X_train = df_train[['Voltage', 'Strain', 'Current']].values
+Y_train = df_train[['SOC', 'Average Temp']].values
+X_test = df_test[['Voltage', 'Strain', 'Current']].values
+Y_test = df_test[['SOC', 'Average Temp']].values
+
+# Initialize and train model
+model = GPRKF()
+
+# Data normalization
+scaler_X = StandardScaler()
+scaler_Y = StandardScaler()
+X_train_normalized = scaler_X.fit_transform(X_train)
+Y_train_normalized = scaler_Y.fit_transform(Y_train)
+X_test_normalized = scaler_X.transform(X_test)
+Y_test_normalized = scaler_Y.transform(Y_test)
+
+# Ensure window size is appropriate
+if model.window_size > len(X_train_normalized):
+    model.window_size = len(X_train_normalized) // 2
+
+# Optimize hyperparameters using training data
+optimal_params = model.optimize_hyperparameters(np.hstack((X_train_normalized, Y_train_normalized)), model.window_size)
+print(f'Optimal Parameters: length_scale={optimal_params[0]}, sigma_f={optimal_params[1]}, sigma_y={optimal_params[2]}')
+
+# Train the model with optimized hyperparameters
+length_scale, sigma_f, sigma_y = optimal_params
+train_predictions, train_std_devs = model.moving_window_predictions(np.hstack((X_train_normalized, Y_train_normalized)), model.window_size, length_scale, sigma_f, sigma_y)
+test_predictions, test_std_devs = model.moving_window_predictions(np.hstack((X_test_normalized, Y_test_normalized)), model.window_size, length_scale, sigma_f, sigma_y)
+
+# Denormalize predictions
+train_predictions_denorm = scaler_Y.inverse_transform(train_predictions)
+test_predictions_denorm = scaler_Y.inverse_transform(test_predictions)
+
+# Denormalize standard deviations
+train_std_devs_denorm = train_std_devs * scaler_Y.scale_
+test_std_devs_denorm = test_std_devs * scaler_Y.scale_
+
+# Calculate RMSE and MAE
+train_rmse = np.sqrt(mean_squared_error(Y_train[model.window_size:], train_predictions_denorm))
+train_mae = mean_absolute_error(Y_train[model.window_size:], train_predictions_denorm)
+test_rmse = np.sqrt(mean_squared_error(Y_test[model.window_size:], test_predictions_denorm))
+test_mae = mean_absolute_error(Y_test[model.window_size:], test_predictions_denorm)
+
+print(f'Train RMSE: {train_rmse}, Train MAE: {train_mae}')
+print(f'Test RMSE: {test_rmse}, Test MAE: {test_mae}')
+
+# Save the trained model
+model_save_path = 'saved_tlgp_model.pkl'
+joblib.dump({
+    'kernel': model.kernel,
+    'scaler_X': scaler_X,
+    'scaler_Y': scaler_Y,
+    'optimal_params': optimal_params
+}, model_save_path)
+print(f"Model and scalers saved to {model_save_path}")
+
+# Save test predictions and std_devs to Excel
+def save_predictions_to_excel(predictions, std_devs, filename):
+    columns = ['Predicted_SOC', 'Predicted_Avg_Temp', 'Std_Dev_SOC', 'Std_Dev_Avg_Temp']
+    data = np.hstack((predictions, std_devs))
+    df = pd.DataFrame(data, columns=columns)
+    df.to_excel(filename, index=False)
+    print(f"Predictions and standard deviations saved to {filename}")
+
+test_predictions_filename = 'TLGP_test_predictions.xlsx'
+save_predictions_to_excel(test_predictions_denorm, test_std_devs_denorm, test_predictions_filename)
+
+# Plot results
+plt.figure(figsize=(14, 7))
+
+# Plot training data predictions
+plt.subplot(2, 1, 1)
+plt.plot(range(model.window_size, len(Y_test)), Y_test[model.window_size:, 0], label='Actual SOC')
+plt.plot(range(model.window_size, len(Y_test)), test_predictions_denorm[:, 0], label='Predicted SOC')
+plt.fill_between(range(model.window_size, len(Y_test)), 
+                 test_predictions_denorm[:, 0] - test_std_devs_denorm[:, 0], 
+                 test_predictions_denorm[:, 0] + test_std_devs_denorm[:, 0], 
+                 color='gray', alpha=0.2)
+plt.title('Training Data Predictions for SOC')
+plt.legend()
+
+# Plot testing data predictions
+plt.subplot(2, 1, 2)
+plt.plot(range(model.window_size, len(Y_test)), Y_test[model.window_size:, 1], label='Actual Avg Temp')
+plt.plot(range(model.window_size, len(Y_test)), test_predictions_denorm[:, 1], label='Predicted Avg Temp')
+plt.fill_between(range(model.window_size, len(Y_test)), 
+                 test_predictions_denorm[:, 1] - test_std_devs_denorm[:, 1], 
+                 test_predictions_denorm[:, 1] + test_std_devs_denorm[:, 1], 
+                 color='gray', alpha=0.2)
+plt.title('Testing Data Predictions for Average Temperature')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
